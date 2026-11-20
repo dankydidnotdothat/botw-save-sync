@@ -1,0 +1,25 @@
+name: Build BOTWSaveSync.nro
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build NRO
+        working-directory: switch
+        run: make
+
+      - name: Upload BOTWSaveSync.nro
+        uses: actions/upload-artifact@v4
+        with:
+          name: BOTWSaveSync-nro
+          path: switch/BOTWSaveSync.nro
