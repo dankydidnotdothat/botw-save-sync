@@ -31,6 +31,9 @@
 #define MAX_LOGS      5
 #define COPY_BUF_SIZE (64 * 1024)
 
+// Порог автокоммита журнала сохранений Switch (1 МБ, как в JKSV)
+#define SAVE_JOURNAL_COMMIT_THRESHOLD (1024 * 1024)
+
 // Палитра (Sheikah Slate / Hyrule Gold)
 #define COL_BG          RGBA8_MAXALPHA(14, 20, 31)
 #define COL_HEADER      RGBA8_MAXALPHA(20, 29, 45)
@@ -113,7 +116,7 @@ static UserEntry g_users[MAX_USERS];
 static s32 g_user_count = 0;
 static s32 g_selected_user = 0;
 
-static char g_status_title[96] = "Ready — FTP server running automatically";
+static char g_status_title[96] = "Ready - FTP server running automatically";
 static u32  g_status_color = COL_CYAN;
 static char g_logs[MAX_LOGS][120];
 static int  g_log_count = 0;
@@ -158,7 +161,6 @@ static void set_status(const char *title, u32 color) {
     mutexUnlock(&g_ui_mutex);
 }
 
-// --- Безопасная склейка путей (корректно работает с "save:/" и "sdmc:/") ---
 static void join_path(char *out, size_t out_sz, const char *base, const char *name) {
     size_t blen = strlen(base);
     if (blen > 0 && base[blen - 1] == '/') {
@@ -168,7 +170,15 @@ static void join_path(char *out, size_t out_sz, const char *base, const char *na
     }
 }
 
-// --- Файловые операции (как в JKSV) ---
+static bool should_skip_for_save(const char *name) {
+    // Не копируем служебные файлы JKSV и ОС внутрь раздела save:/
+    if (strncmp(name, ".nx_save_meta", 13) == 0) return true;
+    if (strcmp(name, ".DS_Store") == 0) return true;
+    if (strncmp(name, "._", 2) == 0) return true;
+    return false;
+}
+
+// --- Файловые операции с автокоммитом журнала save:/ (как в JKSV) ---
 static int mkdir_p(const char *path) {
     char tmp[512];
     size_t len = strlen(path);
@@ -215,33 +225,65 @@ static int remove_dir_contents(const char *dir_path) {
     return rc;
 }
 
-static int copy_file(const char *src, const char *dst) {
+static int copy_file(const char *src, const char *dst, size_t *out_bytes) {
     FILE *in = fopen(src, "rb");
-    if (!in) return -1;
+    if (!in) {
+        add_log("! Open src failed: %s (%d)", src, errno);
+        return -1;
+    }
     FILE *out = fopen(dst, "wb");
-    if (!out) { fclose(in); return -1; }
+    if (!out) {
+        add_log("! Open dst failed: %s (%d)", dst, errno);
+        fclose(in);
+        return -1;
+    }
     unsigned char *buf = (unsigned char *)malloc(COPY_BUF_SIZE);
-    if (!buf) { fclose(in); fclose(out); return -1; }
+    if (!buf) {
+        fclose(in);
+        fclose(out);
+        return -1;
+    }
     size_t n;
+    size_t total = 0;
     int rc = 0;
     while ((n = fread(buf, 1, COPY_BUF_SIZE, in)) > 0) {
-        if (fwrite(buf, 1, n, out) != n) { rc = -1; break; }
+        if (fwrite(buf, 1, n, out) != n) {
+            add_log("! Write failed: %s (%d)", dst, errno);
+            rc = -1;
+            break;
+        }
+        total += n;
     }
-    if (ferror(in)) rc = -1;
+    if (ferror(in)) {
+        add_log("! Read failed: %s (%d)", src, errno);
+        rc = -1;
+    }
     free(buf);
     fclose(in);
-    fclose(out);
+    if (fclose(out) != 0) {
+        add_log("! Close dst failed: %s (%d)", dst, errno);
+        rc = -1;
+    }
+    if (out_bytes) *out_bytes = total;
     return rc;
 }
 
-static int copy_dir_recursive(const char *src_dir, const char *dst_dir, int *file_count) {
-    // Для корня "save:/" mkdir не нужен
+static int copy_dir_recursive(
+    const char *src_dir, const char *dst_dir,
+    int *file_count, bool is_save_dst, size_t *bytes_since_commit
+) {
     if (strcmp(dst_dir, "save:/") != 0 && strcmp(dst_dir, "sdmc:/") != 0) {
-        if (mkdir_p(dst_dir) != 0) return -1;
+        if (mkdir_p(dst_dir) != 0) {
+            add_log("! mkdir failed: %s (%d)", dst_dir, errno);
+            return -1;
+        }
     }
 
     DIR *dir = opendir(src_dir);
-    if (!dir) return -1;
+    if (!dir) {
+        add_log("! opendir failed: %s (%d)", src_dir, errno);
+        return -1;
+    }
 
     struct dirent *ent;
     char src_path[512];
@@ -249,6 +291,8 @@ static int copy_dir_recursive(const char *src_dir, const char *dst_dir, int *fil
 
     while ((ent = readdir(dir)) != NULL) {
         if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+        if (is_save_dst && should_skip_for_save(ent->d_name)) continue;
+
         join_path(src_path, sizeof(src_path), src_dir, ent->d_name);
         join_path(dst_path, sizeof(dst_path), dst_dir, ent->d_name);
 
@@ -256,16 +300,31 @@ static int copy_dir_recursive(const char *src_dir, const char *dst_dir, int *fil
         if (stat(src_path, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            if (copy_dir_recursive(src_path, dst_path, file_count) != 0) {
+            if (copy_dir_recursive(src_path, dst_path, file_count, is_save_dst, bytes_since_commit) != 0) {
                 closedir(dir);
                 return -1;
             }
         } else {
-            if (copy_file(src_path, dst_path) != 0) {
+            size_t written = 0;
+            if (copy_file(src_path, dst_path, &written) != 0) {
                 closedir(dir);
                 return -1;
             }
             if (file_count) (*file_count)++;
+
+            // Автокоммит журнала save:/ каждые 1 МБ, чтобы не переполнять лимит журнала Switch
+            if (is_save_dst && bytes_since_commit) {
+                *bytes_since_commit += written;
+                if (*bytes_since_commit >= SAVE_JOURNAL_COMMIT_THRESHOLD) {
+                    Result crc = fsdevCommitDevice("save");
+                    if (R_FAILED(crc)) {
+                        add_log("! Mid-copy commit failed (0x%x)", crc);
+                        closedir(dir);
+                        return -1;
+                    }
+                    *bytes_since_commit = 0;
+                }
+            }
         }
     }
     closedir(dir);
@@ -339,11 +398,10 @@ static void render_ui(void) {
 
     fill_rect(fb, stride_px, 0, 0, FB_W, FB_H, COL_BG);
 
-    // Шапка + статус встроенного FTP
     fill_rect(fb, stride_px, 0, 0, FB_W, 88, COL_HEADER);
     fill_rect(fb, stride_px, 0, 88, FB_W, 3, COL_GOLD);
     draw_text(fb, stride_px, 44, 20, "BOTW SAVE SYNC", 3, COL_GOLD);
-    draw_text(fb, stride_px, 44, 52, "Built-in FTP + JKSV Save Manager", 2, COL_MUTED);
+    draw_text(fb, stride_px, 44, 52, "Built-in FTP + JKSV Save Manager v2.1", 2, COL_MUTED);
 
     mutexLock(&g_ui_mutex);
     char banner_copy[64];
@@ -363,7 +421,6 @@ static void render_ui(void) {
     draw_rect_border(fb, stride_px, 760, 22, 470, 44, 2, banner_col);
     draw_text(fb, stride_px, 780, 36, banner_copy, 2, banner_col);
 
-    // Левая панель: Профили
     fill_rect(fb, stride_px, 44, 128, 356, 364, COL_CARD);
     draw_rect_border(fb, stride_px, 44, 128, 356, 364, 2, COL_BORDER);
     draw_text(fb, stride_px, 64, 146, "SWITCH PROFILES", 2, COL_GOLD);
@@ -382,7 +439,6 @@ static void render_ui(void) {
         }
     }
 
-    // Правая панель: 3 кнопки действий
     draw_action_card(
         fb, stride_px, BTN_EXPORT, "A", COL_CYAN,
         "EXPORT TO PC (SD SYNC)",
@@ -399,7 +455,6 @@ static void render_ui(void) {
         "Restore previous safety backup to BOTW"
     );
 
-    // Нижняя панель: Статус и журнал
     fill_rect(fb, stride_px, 44, 514, 1186, 152, COL_CARD);
     draw_rect_border(fb, stride_px, 44, 514, 1186, 152, 2, COL_BORDER);
     fill_rect(fb, stride_px, 44, 514, 1186, 4, status_col);
@@ -434,7 +489,6 @@ static void ftp_resolve_sd_path(const char *cwd, const char *arg, char *out_sd, 
         if (strcmp(cwd, "/") == 0) snprintf(combined, sizeof(combined), "/%s", arg);
         else snprintf(combined, sizeof(combined), "%s/%s", cwd, arg);
     }
-    // Убираем возможные хвостовые слэши
     size_t len = strlen(combined);
     while (len > 1 && combined[len - 1] == '/') combined[--len] = '\0';
     snprintf(out_sd, out_sz, "sdmc:%s", combined);
@@ -734,7 +788,7 @@ static void ftp_server_thread(void *arg) {
         strcpy(g_ftp_banner, "FTP: port 5000 busy");
         g_ftp_banner_color = COL_CORAL;
         mutexUnlock(&g_ui_mutex);
-        add_log("FTP: port 5000 already in use (sys-ftpd active?)");
+        add_log("FTP: port 5000 busy (sys-ftpd active?)");
         return;
     }
 
@@ -813,7 +867,7 @@ static void do_dump_to_sync(AccountUid uid) {
     remove_dir_contents(SYNC_DIR);
 
     int count = 0;
-    int err = copy_dir_recursive("save:/", SYNC_DIR, &count);
+    int err = copy_dir_recursive("save:/", SYNC_DIR, &count, false, NULL);
     fsdevUnmountDevice("save");
 
     if (err == 0 && count > 0) {
@@ -851,25 +905,28 @@ static void do_restore_from_dir(AccountUid uid, const char *src_dir, bool make_b
         mkdir_p(BACKUP_DIR);
         remove_dir_contents(BACKUP_DIR);
         int bkp = 0;
-        copy_dir_recursive("save:/", BACKUP_DIR, &bkp);
+        copy_dir_recursive("save:/", BACKUP_DIR, &bkp, false, NULL);
         add_log("  Backed up %d files.", bkp);
     }
 
+    // Очищаем save:/ и СРАЗУ коммитим удаление, чтобы освободить журнал Switch!
     remove_dir_contents("save:/");
+    fsdevCommitDevice("save");
+
     int count = 0;
-    int err = copy_dir_recursive(src_dir, "save:/", &count);
+    size_t bytes_since_commit = 0;
+    int err = copy_dir_recursive(src_dir, "save:/", &count, true, &bytes_since_commit);
     if (err == 0 && count > 0) {
         rc = fsdevCommitDevice("save");
         if (R_SUCCEEDED(rc)) {
             set_status("Import OK! Changes committed to BOTW.", COL_GREEN);
             add_log("OK: Restored & committed %d files.", count);
         } else {
-            set_status("Commit failed! Save not updated.", COL_RED);
+            set_status("Final commit failed!", COL_RED);
             add_log("! fsdevCommitDevice failed (0x%x).", rc);
         }
     } else {
-        set_status("Copy failed! Changes NOT committed.", COL_RED);
-        add_log("! Copy error; save untouched.");
+        set_status("Copy failed! Check log below.", COL_RED);
     }
 
     fsdevUnmountDevice("save");
@@ -890,7 +947,6 @@ int main(int argc, char *argv[]) {
     padInitializeDefault(&pad);
     hidInitializeTouchScreen();
 
-    // Инициализируем аккаунты как в JKSV (Administrator -> fallback Application)
     bool acc_ok = R_SUCCEEDED(accountInitialize(AccountServiceType_Administrator));
     if (!acc_ok) {
         acc_ok = R_SUCCEEDED(accountInitialize(AccountServiceType_Application));
@@ -899,10 +955,8 @@ int main(int argc, char *argv[]) {
         load_users();
     }
 
-    // Создаём папку Sync заранее, чтобы ПК сразу её видел по FTP
     mkdir_p(SYNC_DIR);
 
-    // Запускаем сеть и встроенный FTP-сервер в фоне
     socketInitializeDefault();
     nifmInitialize(NifmServiceType_User);
     g_ftp_running = true;
@@ -913,7 +967,7 @@ int main(int argc, char *argv[]) {
     }
 
     add_log("Sync dir: %s", SYNC_DIR);
-    add_log("FTP starts automatically on port 5000. Use [A] or [Y].");
+    add_log("FTP auto-starts on port 5000. Use [A] or [Y].");
 
     bool prev_touch = false;
 
