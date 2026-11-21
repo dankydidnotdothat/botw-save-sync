@@ -2,18 +2,16 @@
 
 Набор из двух программ с графическим интерфейсом для автоматической синхронизации и конвертации сохранений *The Legend of Zelda: Breath of the Wild* между ПК (эмулятор Cemu) и прошитой Nintendo Switch — без отдельного JKSV и FTPD.
 
-Готовые к запуску файлы (`BOTWSaveSync.nro` для Switch и `botw_save_sync.py` для ПК) уже загружены в корень основной ветки (`main`), поэтому ничего собирать вручную не нужно.
+Готовые к запуску файлы (`BOTWSaveSync.nro` для Switch в корне репозитория и `pc/botw_save_sync.py` для ПК) уже загружены в основную ветку (`main`), поэтому ничего собирать вручную не нужно.
 
 ## Структура репозитория
 
 ```text
 botw-save-sync/
-├── BOTWSaveSync.nro             # Готовое homebrew-приложение для Nintendo Switch (v2.2)
-├── botw_save_sync.py            # Готовая программа для ПК с GUI (Python 3, без зависимостей)
-├── botw_sync_config.json        # Файл конфигурации ПК-программы
-├── main.c                       # Актуальный исходный код Switch homebrew (v2.2)
+├── BOTWSaveSync.nro        # Готовое homebrew-приложение для Nintendo Switch (v2.2)
 ├── pc/
-│   └── botw_save_sync.py        # Копия ПК-программы в папке исходников
+│   ├── botw_save_sync.py       # Готовая программа для ПК с GUI (Python 3, без зависимостей)
+│   └── botw_sync_config.json   # Файл конфигурации ПК-программы
 ├── switch/
 │   ├── Makefile                 # Сборка BOTWSaveSync.nro из исходников (devkitA64 + libnx)
 │   └── source/
@@ -51,7 +49,7 @@ botw-save-sync/
 3. Запустите *Breath of the Wild* на Switch хотя бы один раз под нужным профилем до главного меню и закройте игру (чтобы система создала контейнер сохранения).
 
 ### 2. Настройка программы на ПК (один раз)
-1. Скачайте `botw_save_sync.py` из корня репозитория и запустите его (нужен Python 3, дополнительные пакеты не требуются):
+1. Скачайте `pc/botw_save_sync.py` из репозитория и запустите его (нужен Python 3, дополнительные пакеты не требуются):
    ```bash
    python botw_save_sync.py
    ```
