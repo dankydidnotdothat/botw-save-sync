@@ -29,10 +29,7 @@
 #define FB_H          720
 #define MAX_USERS     8
 #define MAX_LOGS      5
-#define COPY_BUF_SIZE (64 * 1024)
-
-// Порог автокоммита журнала сохранений Switch (1 МБ, как в JKSV)
-#define SAVE_JOURNAL_COMMIT_THRESHOLD (1024 * 1024)
+#define COPY_BUF_SIZE (16 * 1024)
 
 // Палитра (Sheikah Slate / Hyrule Gold)
 #define COL_BG          RGBA8_MAXALPHA(14, 20, 31)
@@ -171,14 +168,13 @@ static void join_path(char *out, size_t out_sz, const char *base, const char *na
 }
 
 static bool should_skip_for_save(const char *name) {
-    // Не копируем служебные файлы JKSV и ОС внутрь раздела save:/
     if (strncmp(name, ".nx_save_meta", 13) == 0) return true;
     if (strcmp(name, ".DS_Store") == 0) return true;
     if (strncmp(name, "._", 2) == 0) return true;
     return false;
 }
 
-// --- Файловые операции с автокоммитом журнала save:/ (как в JKSV) ---
+// --- Файловые операции с коммитом каждого файла в save:/ ---
 static int mkdir_p(const char *path) {
     char tmp[512];
     size_t len = strlen(path);
@@ -225,7 +221,7 @@ static int remove_dir_contents(const char *dir_path) {
     return rc;
 }
 
-static int copy_file(const char *src, const char *dst, size_t *out_bytes) {
+static int copy_file(const char *src, const char *dst) {
     FILE *in = fopen(src, "rb");
     if (!in) {
         add_log("! Open src failed: %s (%d)", src, errno);
@@ -244,7 +240,6 @@ static int copy_file(const char *src, const char *dst, size_t *out_bytes) {
         return -1;
     }
     size_t n;
-    size_t total = 0;
     int rc = 0;
     while ((n = fread(buf, 1, COPY_BUF_SIZE, in)) > 0) {
         if (fwrite(buf, 1, n, out) != n) {
@@ -252,7 +247,6 @@ static int copy_file(const char *src, const char *dst, size_t *out_bytes) {
             rc = -1;
             break;
         }
-        total += n;
     }
     if (ferror(in)) {
         add_log("! Read failed: %s (%d)", src, errno);
@@ -264,18 +258,17 @@ static int copy_file(const char *src, const char *dst, size_t *out_bytes) {
         add_log("! Close dst failed: %s (%d)", dst, errno);
         rc = -1;
     }
-    if (out_bytes) *out_bytes = total;
     return rc;
 }
 
-static int copy_dir_recursive(
-    const char *src_dir, const char *dst_dir,
-    int *file_count, bool is_save_dst, size_t *bytes_since_commit
-) {
+static int copy_dir_recursive(const char *src_dir, const char *dst_dir, int *file_count, bool is_save_dst) {
     if (strcmp(dst_dir, "save:/") != 0 && strcmp(dst_dir, "sdmc:/") != 0) {
         if (mkdir_p(dst_dir) != 0) {
             add_log("! mkdir failed: %s (%d)", dst_dir, errno);
             return -1;
+        }
+        if (is_save_dst) {
+            fsdevCommitDevice("save");
         }
     }
 
@@ -300,29 +293,24 @@ static int copy_dir_recursive(
         if (stat(src_path, &st) != 0) continue;
 
         if (S_ISDIR(st.st_mode)) {
-            if (copy_dir_recursive(src_path, dst_path, file_count, is_save_dst, bytes_since_commit) != 0) {
+            if (copy_dir_recursive(src_path, dst_path, file_count, is_save_dst) != 0) {
                 closedir(dir);
                 return -1;
             }
         } else {
-            size_t written = 0;
-            if (copy_file(src_path, dst_path, &written) != 0) {
+            if (copy_file(src_path, dst_path) != 0) {
                 closedir(dir);
                 return -1;
             }
             if (file_count) (*file_count)++;
 
-            // Автокоммит журнала save:/ каждые 1 МБ, чтобы не переполнять лимит журнала Switch
-            if (is_save_dst && bytes_since_commit) {
-                *bytes_since_commit += written;
-                if (*bytes_since_commit >= SAVE_JOURNAL_COMMIT_THRESHOLD) {
-                    Result crc = fsdevCommitDevice("save");
-                    if (R_FAILED(crc)) {
-                        add_log("! Mid-copy commit failed (0x%x)", crc);
-                        closedir(dir);
-                        return -1;
-                    }
-                    *bytes_since_commit = 0;
+            // Коммитим журнал save:/ ПОСЛЕ КАЖДОГО файла (гарантированно без переполнения журнала Switch)
+            if (is_save_dst) {
+                Result crc = fsdevCommitDevice("save");
+                if (R_FAILED(crc)) {
+                    add_log("! Commit failed after %s (0x%x)", ent->d_name, crc);
+                    closedir(dir);
+                    return -1;
                 }
             }
         }
@@ -401,7 +389,7 @@ static void render_ui(void) {
     fill_rect(fb, stride_px, 0, 0, FB_W, 88, COL_HEADER);
     fill_rect(fb, stride_px, 0, 88, FB_W, 3, COL_GOLD);
     draw_text(fb, stride_px, 44, 20, "BOTW SAVE SYNC", 3, COL_GOLD);
-    draw_text(fb, stride_px, 44, 52, "Built-in FTP + JKSV Save Manager v2.1", 2, COL_MUTED);
+    draw_text(fb, stride_px, 44, 52, "Built-in FTP + JKSV Save Manager v2.2", 2, COL_MUTED);
 
     mutexLock(&g_ui_mutex);
     char banner_copy[64];
@@ -828,7 +816,7 @@ static void ftp_server_thread(void *arg) {
     close(sfd);
 }
 
-// --- Работа с профилями и сохранениями BOTW (как в JKSV) ---
+// --- Работа с профилями и сохранениями BOTW ---
 static void load_users(void) {
     AccountUid uids[MAX_USERS];
     s32 total = 0;
@@ -867,7 +855,7 @@ static void do_dump_to_sync(AccountUid uid) {
     remove_dir_contents(SYNC_DIR);
 
     int count = 0;
-    int err = copy_dir_recursive("save:/", SYNC_DIR, &count, false, NULL);
+    int err = copy_dir_recursive("save:/", SYNC_DIR, &count, false);
     fsdevUnmountDevice("save");
 
     if (err == 0 && count > 0) {
@@ -905,17 +893,15 @@ static void do_restore_from_dir(AccountUid uid, const char *src_dir, bool make_b
         mkdir_p(BACKUP_DIR);
         remove_dir_contents(BACKUP_DIR);
         int bkp = 0;
-        copy_dir_recursive("save:/", BACKUP_DIR, &bkp, false, NULL);
+        copy_dir_recursive("save:/", BACKUP_DIR, &bkp, false);
         add_log("  Backed up %d files.", bkp);
     }
 
-    // Очищаем save:/ и СРАЗУ коммитим удаление, чтобы освободить журнал Switch!
     remove_dir_contents("save:/");
     fsdevCommitDevice("save");
 
     int count = 0;
-    size_t bytes_since_commit = 0;
-    int err = copy_dir_recursive(src_dir, "save:/", &count, true, &bytes_since_commit);
+    int err = copy_dir_recursive(src_dir, "save:/", &count, true);
     if (err == 0 && count > 0) {
         rc = fsdevCommitDevice("save");
         if (R_SUCCEEDED(rc)) {
