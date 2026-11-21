@@ -1,0 +1,10 @@
+{
+  "cemu_path": "C:\\Users\\goofu\\AppData\\Roaming\\Cemu\\mlc01\\usr\\save\\00050000\\101c9500\\user\\80000001",
+  "mode": "ftp",
+  "ftp_host": "192.168.0.199",
+  "ftp_port": "5000",
+  "ftp_path": "/JKSV/The Legend of Zelda Breath of the Wild/Sync",
+  "sw_local": "",
+  "downgrade_to_150": true,
+  "backup": true
+}
